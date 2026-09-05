@@ -2,6 +2,8 @@ package com.voiceping.offlinetranscription.ui.transcription
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.voiceping.offlinetranscription.model.AudioInputMode
@@ -107,6 +109,57 @@ class TranscriptionViewModel(
     fun transcribeTestAsset(context: Context) {
         val cached = copyAssetIfMissing(context, "test_speech.wav")
         engine.transcribeFile(cached.absolutePath)
+    }
+
+    /**
+     * Handles a user-picked audio file (from the system file/document picker).
+     * Content URIs cannot be read directly by the native engines, so the file
+     * is first copied into the app cache dir, then transcribed the same way
+     * as the bundled test asset.
+     */
+    fun transcribeFromUri(context: Context, uri: Uri) {
+        launchEngineAction {
+            try {
+                val extension = guessExtension(context, uri)
+                val cached = File(context.cacheDir, "picked_audio_${System.currentTimeMillis()}$extension")
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    cached.outputStream().use { output -> input.copyTo(output) }
+                } ?: run {
+                    Log.e("TranscriptionViewModel", "transcribeFromUri: could not open input stream for $uri")
+                    return@launchEngineAction
+                }
+                engine.transcribeFile(cached.absolutePath)
+            } catch (e: Exception) {
+                Log.e("TranscriptionViewModel", "transcribeFromUri failed", e)
+            }
+        }
+    }
+
+    private fun guessExtension(context: Context, uri: Uri): String {
+        val type = context.contentResolver.getType(uri) ?: ""
+        return when {
+            type.contains("wav") -> ".wav"
+            type.contains("mp3") || type.contains("mpeg") -> ".mp3"
+            type.contains("m4a") || type.contains("mp4") -> ".m4a"
+            type.contains("ogg") -> ".ogg"
+            type.contains("flac") -> ".flac"
+            else -> {
+                val name = uri.lastPathSegment ?: ""
+                val dot = name.lastIndexOf('.')
+                if (dot >= 0) name.substring(dot) else ".wav"
+            }
+        }
+    }
+
+    /** Writes the current full transcription text to a user-chosen destination Uri. */
+    fun saveTranscriptionToUri(context: Context, uri: Uri) {
+        try {
+            context.contentResolver.openOutputStream(uri)?.use { output ->
+                output.write(fullText.toByteArray())
+            }
+        } catch (e: Exception) {
+            Log.e("TranscriptionViewModel", "saveTranscriptionToUri failed", e)
+        }
     }
 
     fun stopIfRecording() {
