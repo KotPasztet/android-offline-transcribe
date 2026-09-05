@@ -31,9 +31,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.UploadFile
+import android.net.Uri
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -131,6 +134,21 @@ fun TranscriptionScreen(viewModel: TranscriptionViewModel, onChangeModel: () -> 
             pendingPermissionStart = false
             Log.i("TranscriptionScreen", "Permission result ignored (granted=$granted)")
         }
+    }
+
+    // Pick an audio file from device storage (Files app / Downloads / gallery, etc.)
+    // and run it through the transcription engine.
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { viewModel.transcribeFromUri(context, it) }
+    }
+
+    // Save the current transcription to a .txt file chosen by the user.
+    val saveTextLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        uri?.let { viewModel.saveTranscriptionToUri(context, it) }
     }
 
     fun requestSystemAudioCapture() {
@@ -300,6 +318,11 @@ fun TranscriptionScreen(viewModel: TranscriptionViewModel, onChangeModel: () -> 
             ControlButtonsRow(
                 isRecording = isRecording,
                 onTestAudio = { viewModel.transcribeTestAsset(context) },
+                onUploadFile = { filePickerLauncher.launch("audio/*") },
+                onSaveText = {
+                    val fileName = "transcription_${System.currentTimeMillis()}.txt"
+                    saveTextLauncher.launch(fileName)
+                },
                 onRecord = { onRecordClick() },
                 onSettings = { showSettings = true }
             )
@@ -477,13 +500,15 @@ private fun TranscriptionTextDisplay(
 private fun ControlButtonsRow(
     isRecording: Boolean,
     onTestAudio: () -> Unit,
+    onUploadFile: () -> Unit,
+    onSaveText: () -> Unit,
     onRecord: () -> Unit,
     onSettings: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = 8.dp, vertical = 12.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -500,14 +525,40 @@ private fun ControlButtonsRow(
             )
         }
 
-        Spacer(modifier = Modifier.width(12.dp))
+        // Upload / pick any audio file from device storage and transcribe it.
+        IconButton(
+            onClick = onUploadFile,
+            enabled = !isRecording,
+            modifier = Modifier.semantics { contentDescription = "Upload Audio File" }
+        ) {
+            Icon(
+                Icons.Filled.UploadFile,
+                contentDescription = null,
+                tint = if (!isRecording) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
 
         RecordButton(
             isRecording = isRecording,
             onClick = onRecord
         )
 
-        Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(8.dp))
+
+        // Save the current transcription text to a .txt file.
+        IconButton(
+            onClick = onSaveText,
+            modifier = Modifier.semantics { contentDescription = "Save Transcription as TXT" }
+        ) {
+            Icon(
+                Icons.Filled.Save,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
 
         IconButton(
             onClick = onSettings,
