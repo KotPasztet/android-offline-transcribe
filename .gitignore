@@ -1,0 +1,52 @@
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# === Android ===
+VoicePingAndroidOfflineTranscribe/.gradle/
+VoicePingAndroidOfflineTranscribe/build/
+VoicePingAndroidOfflineTranscribe/app/build/
+VoicePingAndroidOfflineTranscribe/local.properties
+VoicePingAndroidOfflineTranscribe/.cxx/
+VoicePingAndroidOfflineTranscribe/app/.cxx/
+VoicePingAndroidOfflineTranscribe/captures/
+VoicePingAndroidOfflineTranscribe/.kotlin/
+
+# Android Studio / IntelliJ
+VoicePingAndroidOfflineTranscribe/.idea/
+*.iml
+
+# sherpa-onnx binaries (download from GitHub releases, see README)
+VoicePingAndroidOfflineTranscribe/app/libs/*.aar
+
+# === IDE ===
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+
+# === Secrets / Environment ===
+.env
+.env.*
+*.keystore
+*.jks
+google-services.json
+
+# === Test Evidence / Screenshots ===
+artifacts/
+screenshots/
+!docs/screenshots/
+!assets/screenshots/
+
+# === Room Schema Exports (using manual migrations) ===
+VoicePingAndroidOfflineTranscribe/app/schemas/
+
+# === Claude Code ===
+.claude/
+
+# === Python cache ===
+__pycache__/
+*.pyc
