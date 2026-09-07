@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -20,7 +21,7 @@ import com.voiceping.offlinetranscription.ui.components.ModelPickerRow
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModelSetupScreen(viewModel: ModelSetupViewModel) {
+fun ModelSetupScreen(viewModel: ModelSetupViewModel, onCancel: (() -> Unit)? = null) {
     val modelState by viewModel.modelState.collectAsState()
     val downloadProgress by viewModel.downloadProgress.collectAsState()
     val selectedModel by viewModel.selectedModel.collectAsState()
@@ -28,7 +29,16 @@ fun ModelSetupScreen(viewModel: ModelSetupViewModel) {
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("Setup") })
+            TopAppBar(
+                title = { Text("Setup") },
+                navigationIcon = {
+                    if (onCancel != null) {
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Filled.ArrowBack, contentDescription = "Anuluj, wróć bez zmiany modelu")
+                        }
+                    }
+                }
+            )
         }
     ) { paddingValues ->
         Column(

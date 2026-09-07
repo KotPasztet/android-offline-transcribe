@@ -4,6 +4,9 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,7 +26,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -39,14 +46,22 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import android.widget.Toast
 import com.voiceping.offlinetranscription.data.cassette.MemoEntity
 import com.voiceping.offlinetranscription.util.FormatUtils
 
@@ -177,20 +192,52 @@ private fun LiveTranscriptCard(
     hypothesisText: String,
     modelName: String
 ) {
+    val fullText = remember(confirmedText, hypothesisText) {
+        buildString {
+            append(confirmedText)
+            if (hypothesisText.isNotBlank()) {
+                if (isNotEmpty()) append(" ")
+                append(hypothesisText)
+            }
+        }.ifBlank { "..." }
+    }
+    val scrollState = rememberScrollState()
+
+    // Keep the latest tokens in view as they arrive, but the user can still
+    // scroll up manually to re-read earlier parts — scrollState isn't reset,
+    // just nudged to the bottom whenever new text comes in.
+    LaunchedEffect(fullText) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(12.dp)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text(
-                when {
-                    isRecording -> "Nagrywanie... ($modelName)"
-                    else -> "Importowanie pliku... (${(progress * 100).toInt()}%)"
-                },
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    when {
+                        isRecording -> "Nagrywanie... ($modelName)"
+                        else -> "Importowanie pliku... (${(progress * 100).toInt()}%)"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                val clipboardManager = LocalClipboardManager.current
+                val context = LocalContext.current
+                IconButton(onClick = {
+                    clipboardManager.setText(AnnotatedString(fullText))
+                    Toast.makeText(context, "Skopiowano transkrypcję", Toast.LENGTH_SHORT).show()
+                }) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = "Kopiuj dotychczasową transkrypcję")
+                }
+            }
             if (isImporting) {
                 Spacer(modifier = Modifier.height(6.dp))
                 LinearProgressIndicator(
@@ -200,14 +247,12 @@ private fun LiveTranscriptCard(
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = buildString {
-                    append(confirmedText)
-                    if (hypothesisText.isNotBlank()) {
-                        if (isNotEmpty()) append(" ")
-                        append(hypothesisText)
-                    }
-                }.ifBlank { "..." },
-                style = MaterialTheme.typography.bodyMedium
+                text = fullText,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 220.dp)
+                    .verticalScroll(scrollState)
             )
         }
     }
@@ -220,6 +265,10 @@ private fun MemoRow(
     onPlay: () -> Unit,
     onDelete: () -> Unit
 ) {
+    var expanded by remember(memo.id) { mutableStateOf(false) }
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -235,18 +284,39 @@ private fun MemoRow(
                     .background(labelColor)
             )
             Spacer(modifier = Modifier.width(10.dp))
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    // Tap the transcript to expand/collapse it — this is how you
+                    // read a memo's full text instead of just the truncated preview.
+                    .clickable { expanded = !expanded }
+            ) {
                 Text(
                     memo.transcriptText.ifBlank { "(brak transkrypcji)" },
                     style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 3
+                    maxLines = if (expanded) Int.MAX_VALUE else 3
                 )
                 Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    "${FormatUtils.formatDuration(memo.durationMs / 1000.0)} · ${memo.modelDisplayName}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${FormatUtils.formatDuration(memo.durationMs / 1000.0)} · ${memo.modelDisplayName}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Icon(
+                        if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = if (expanded) "Zwiń transkrypcję" else "Rozwiń transkrypcję",
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            IconButton(onClick = {
+                clipboardManager.setText(AnnotatedString(memo.transcriptText))
+                Toast.makeText(context, "Skopiowano transkrypcję", Toast.LENGTH_SHORT).show()
+            }) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = "Kopiuj transkrypcję")
             }
             IconButton(onClick = onPlay) {
                 Icon(Icons.Filled.PlayArrow, contentDescription = "Odtwórz")

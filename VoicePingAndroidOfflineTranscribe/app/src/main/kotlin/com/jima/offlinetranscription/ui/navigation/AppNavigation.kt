@@ -70,7 +70,13 @@ fun AppNavigation(
     NavHost(navController = navController, startDestination = startDestination) {
         composable(Routes.SETUP) {
             val viewModel = remember { ModelSetupViewModel(engine) }
-            ModelSetupScreen(viewModel = viewModel)
+            val canGoBack = navController.previousBackStackEntry != null
+            ModelSetupScreen(
+                viewModel = viewModel,
+                onCancel = if (canGoBack) {
+                    { navController.popBackStack() }
+                } else null
+            )
         }
 
         composable(Routes.HOME) {
@@ -79,7 +85,11 @@ fun AppNavigation(
                 viewModel = viewModel,
                 onOpenCassette = { id -> navController.navigate(Routes.cassette(id)) },
                 onOpenSettings = {
-                    engine.unloadModel()
+                    // Just open the model picker — don't unload the current model.
+                    // Unloading only happens when the user actually picks a
+                    // different one (ModelSetupViewModel.selectAndSetup handles
+                    // that). Otherwise cancelling would leave the app with no
+                    // model loaded and no way back.
                     engine.clearError()
                     navController.navigate(Routes.SETUP) {
                         popUpTo(Routes.HOME) { inclusive = false }
@@ -100,7 +110,6 @@ fun AppNavigation(
                 viewModel = viewModel,
                 onBack = { navController.popBackStack() },
                 onOpenSettings = {
-                    engine.unloadModel()
                     engine.clearError()
                     navController.navigate(Routes.SETUP) {
                         popUpTo(Routes.HOME) { inclusive = false }
@@ -114,7 +123,6 @@ fun AppNavigation(
             TranscriptionScreen(
                 viewModel = viewModel,
                 onChangeModel = {
-                    engine.unloadModel()
                     engine.clearError()
                     navController.navigate(Routes.SETUP) {
                         popUpTo(Routes.TRANSCRIBE) { inclusive = true }

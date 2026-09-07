@@ -21,6 +21,14 @@ To jest PEŁNE repo `android-offline-transcribe` (razem z submodułem
 - Żywe nagrywanie: zrzut co 5s, po crashu odzyskiwane jako gotowe memo (nie da się dosłownie wznowić mikrofonu po śmierci procesu)
 - **Zabezpieczenie przed pętlą**: jeśli wznowienie utknie w tym samym miejscu >2 razy, albo przy powtórce zebrany tekst ma <5 słów — appka porzuca checkpoint zamiast próbować w kółko przy każdym starcie. Progi do zmiany: `MAX_RETRIES_AT_SAME_CHUNK`, `MIN_WORDS_TO_TRUST_PROGRESS` w `TranscriptionCheckpointStore.kt`.
 
+## Faza 4 — poprawki UX (pułapka w ustawieniach, rozwijanie, kopiowanie)
+- Wejście w ustawienia nie wyładowuje już modelu z góry — tylko przy
+  faktycznej zmianie na inny.
+- `ModelSetupScreen` ma przycisk wstecz, gdy jest dokąd wracać.
+- Transkrypt memo na liście: dotknięcie rozwija/zwija pełny tekst.
+- Przycisk kopiowania (schowek) przy każdym memo i na karcie live-transkryptu.
+
+
 ## Budowanie — zalecane: GitHub Actions (nie Termux)
 
 Ten projekt ma natywne C++/CMake/NDK (whisper.cpp, sherpa-onnx) —
