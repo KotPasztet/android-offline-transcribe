@@ -3,6 +3,7 @@ package com.voiceping.offlinetranscription
 import android.app.Application
 import android.util.Log
 import com.voiceping.offlinetranscription.data.AppPreferences
+import com.voiceping.offlinetranscription.data.cassette.CassetteRepository
 import com.voiceping.offlinetranscription.model.ModelInfo
 import com.voiceping.offlinetranscription.service.WhisperEngine
 import java.io.File
@@ -48,11 +49,15 @@ class OfflineTranscriptionApp : Application() {
     lateinit var whisperEngine: WhisperEngine
         private set
 
+    lateinit var cassetteRepository: CassetteRepository
+        private set
+
     override fun onCreate() {
         super.onCreate()
         migrateModelCacheIfNeeded()
         preferences = AppPreferences(this)
         whisperEngine = WhisperEngine(this, preferences)
+        cassetteRepository = CassetteRepository(this)
     }
 
     override fun onTerminate() {

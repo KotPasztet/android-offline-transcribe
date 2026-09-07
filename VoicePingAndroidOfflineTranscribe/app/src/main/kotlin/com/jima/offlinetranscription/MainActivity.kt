@@ -127,7 +127,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 } else {
-                    AppNavigation(engine = app.whisperEngine)
+                    AppNavigation(engine = app.whisperEngine, cassetteRepository = app.cassetteRepository)
                 }
             }
         }

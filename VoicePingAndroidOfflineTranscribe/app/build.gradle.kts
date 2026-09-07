@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -73,6 +74,11 @@ dependencies {
 
     // Navigation
     implementation(libs.navigation)
+
+    // Room (local database for cassettes/memos)
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    ksp(libs.room.compiler)
 
     // Lifecycle
     implementation(libs.lifecycle.viewmodel)

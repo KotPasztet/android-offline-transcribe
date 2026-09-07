@@ -1,3 +1,0 @@
-[submodule "VoicePingAndroidOfflineTranscribe/whisper.cpp"]
-	path = VoicePingAndroidOfflineTranscribe/whisper.cpp
-	url = https://github.com/ggml-org/whisper.cpp.git

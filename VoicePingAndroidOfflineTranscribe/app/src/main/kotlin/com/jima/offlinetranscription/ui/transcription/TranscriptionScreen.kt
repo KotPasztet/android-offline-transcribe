@@ -45,6 +45,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -198,6 +199,7 @@ fun TranscriptionScreen(viewModel: TranscriptionViewModel, onChangeModel: () -> 
     val enableTimestamps by viewModel.enableTimestamps.collectAsState()
     val audioInputMode by viewModel.audioInputMode.collectAsState()
     val systemAudioCaptureReady by viewModel.systemAudioCaptureReady.collectAsState()
+    val fileTranscriptionProgress by viewModel.fileTranscriptionProgress.collectAsState()
     val displayConfirmedText = remember(confirmedText) { confirmedText.trim() }
     val displayHypothesisText = remember(hypothesisText) { hypothesisText.trim() }
 
@@ -313,6 +315,16 @@ fun TranscriptionScreen(viewModel: TranscriptionViewModel, onChangeModel: () -> 
                 }
 
                 ResourceStatsBar(viewModel, isRecording, elapsedSeconds)
+            }
+
+            // Progress bar for an in-flight file transcription (0f when idle/live-recording).
+            if (fileTranscriptionProgress > 0f && fileTranscriptionProgress < 1f && !isRecording) {
+                LinearProgressIndicator(
+                    progress = { fileTranscriptionProgress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 2.dp)
+                )
             }
 
             ControlButtonsRow(

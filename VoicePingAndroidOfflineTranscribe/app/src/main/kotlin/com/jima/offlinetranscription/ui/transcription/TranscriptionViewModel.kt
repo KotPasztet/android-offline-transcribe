@@ -35,6 +35,7 @@ class TranscriptionViewModel(
     val cpuPercent = engine.cpuPercent
     val memoryMB = engine.memoryMB
     val e2eResult = engine.e2eResult
+    val fileTranscriptionProgress = engine.fileTranscriptionProgress
 
     // Translation state
     val translationEnabled = engine.translationEnabled
@@ -113,22 +114,33 @@ class TranscriptionViewModel(
 
     /**
      * Handles a user-picked audio file (from the system file/document picker).
-     * Content URIs cannot be read directly by the native engines, so the file
-     * is first copied into the app cache dir, then transcribed the same way
-     * as the bundled test asset.
+     * WAV files are copied as-is (the engine has a dedicated WAV reader).
+     * Any other container (m4a/aac, mp3, ogg, 3gp, ...) is transcoded to a
+     * 16kHz mono WAV first via [AudioDecodeUtils], since the native ASR
+     * engines only accept raw PCM.
      */
     fun transcribeFromUri(context: Context, uri: Uri) {
         launchEngineAction {
             try {
                 val extension = guessExtension(context, uri)
-                val cached = File(context.cacheDir, "picked_audio_${System.currentTimeMillis()}$extension")
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    cached.outputStream().use { output -> input.copyTo(output) }
-                } ?: run {
-                    Log.e("TranscriptionViewModel", "transcribeFromUri: could not open input stream for $uri")
-                    return@launchEngineAction
+                val timestamp = System.currentTimeMillis()
+
+                val wavFile = if (extension == ".wav") {
+                    val cached = File(context.cacheDir, "picked_audio_$timestamp.wav")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        cached.outputStream().use { output -> input.copyTo(output) }
+                    } ?: run {
+                        Log.e("TranscriptionViewModel", "transcribeFromUri: could not open input stream for $uri")
+                        return@launchEngineAction
+                    }
+                    cached
+                } else {
+                    val decoded = File(context.cacheDir, "picked_audio_decoded_$timestamp.wav")
+                    com.voiceping.offlinetranscription.util.AudioDecodeUtils.decodeToWavFile(context, uri, decoded)
+                    decoded
                 }
-                engine.transcribeFile(cached.absolutePath)
+
+                engine.transcribeFile(wavFile.absolutePath)
             } catch (e: Exception) {
                 Log.e("TranscriptionViewModel", "transcribeFromUri failed", e)
             }

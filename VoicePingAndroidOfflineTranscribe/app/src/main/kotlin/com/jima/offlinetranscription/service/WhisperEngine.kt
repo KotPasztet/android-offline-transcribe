@@ -15,6 +15,7 @@ import com.voiceping.offlinetranscription.model.EngineType
 import com.voiceping.offlinetranscription.model.ModelInfo
 import com.voiceping.offlinetranscription.model.ModelState
 import com.voiceping.offlinetranscription.util.TextNormalizationUtils
+import com.voiceping.offlinetranscription.util.TranscriptionCheckpointStore
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -49,6 +50,7 @@ class WhisperEngine(
     private val modelsDir = File(context.filesDir, "asr_models")
     private val downloader = ModelDownloader(modelsDir)
     val audioRecorder = AudioRecorder(context)
+    val checkpointStore = TranscriptionCheckpointStore(context)
 
     // Model state
     private val _modelState = MutableStateFlow(ModelState.Unloaded)
@@ -80,6 +82,10 @@ class WhisperEngine(
 
     private val _bufferSeconds = MutableStateFlow(0.0)
     val bufferSeconds: StateFlow<Double> = _bufferSeconds.asStateFlow()
+
+    /** Progress of an in-flight file transcription, 0f..1f. 0f when idle. */
+    private val _fileTranscriptionProgress = MutableStateFlow(0f)
+    val fileTranscriptionProgress: StateFlow<Float> = _fileTranscriptionProgress.asStateFlow()
 
     private val _tokensPerSecond = MutableStateFlow(0.0)
     val tokensPerSecond: StateFlow<Double> = _tokensPerSecond.asStateFlow()
@@ -206,6 +212,14 @@ class WhisperEngine(
 
     val recordingDurationSeconds: Double
         get() = audioRecorder.bufferSeconds
+
+    /**
+     * Snapshot of the raw PCM samples for the most recently finished (or
+     * in-progress) recording session. Valid after [stopRecording] until the
+     * next [startRecording]/[resetTranscriptionState] call. Used to persist
+     * a memo's audio to disk (e.g. for the cassette feature).
+     */
+    fun getRecordedSamplesSnapshot(): FloatArray = audioRecorder.samples
 
     init {
         scope.launch {
@@ -781,6 +795,7 @@ class WhisperEngine(
         _bufferSeconds.value = 0.0
         _tokensPerSecond.value = 0.0
         _lastError.value = null
+        _fileTranscriptionProgress.value = 0f
         audioRecorder.reset()
     }
 
@@ -794,8 +809,23 @@ class WhisperEngine(
         lastTranslationInput = null
     }
 
-    /** Transcribe a WAV file. Used for testing and file import UI. */
-    fun transcribeFile(filePath: String, languageHint: String = "auto") {
+    /**
+     * Transcribe a WAV file. Used for testing and file import UI.
+     *
+     * Crash-resume: if a checkpoint from a previous, interrupted run of
+     * this exact file exists (see [TranscriptionCheckpointStore]), we pick
+     * up from the last fully-processed chunk instead of starting over —
+     * unless [TranscriptionCheckpointStore.FileCheckpoint.shouldAutoResume]
+     * says we've already retried the same stuck point too many times
+     * (e.g. it crashes again almost immediately every time), in which case
+     * we abandon the checkpoint and start fresh once, to avoid looping
+     * forever on app startup.
+     *
+     * [cassetteId] is optional metadata carried in the checkpoint so a
+     * crash-recovery coordinator can know which cassette to file the
+     * eventual memo under; WhisperEngine itself doesn't touch the cassette DB.
+     */
+    fun transcribeFile(filePath: String, languageHint: String = "auto", cassetteId: Long? = null) {
         val engine = currentEngine
         if (engine == null || !engine.isLoaded) {
             Log.e("WhisperEngine", "transcribeFile: model not ready")
@@ -811,12 +841,34 @@ class WhisperEngine(
             return
         }
 
+        // Resume support: reuse an existing checkpoint only if it's for this
+        // exact file and hasn't exceeded its retry budget.
+        val existingCheckpoint = checkpointStore.loadFileCheckpoint()
+            ?.takeIf { it.wavFilePath == filePath }
+        val resumeFrom: TranscriptionCheckpointStore.FileCheckpoint? = when {
+            existingCheckpoint == null -> null
+            existingCheckpoint.shouldAutoResume() -> checkpointStore.beginAttempt(existingCheckpoint)
+            else -> {
+                Log.w(
+                    "WhisperEngine",
+                    "transcribeFile: checkpoint for $filePath exhausted its retry budget " +
+                        "(attemptCount=${existingCheckpoint.attemptCount}), starting fresh instead of looping"
+                )
+                checkpointStore.clearFileCheckpoint()
+                null
+            }
+        }
+
         resetTranscriptionState()
         transitionTo(SessionState.Recording)
-        _hypothesisText.value = "Transcribing file..."
+        _hypothesisText.value = if (resumeFrom != null) "Wznawianie transkrypcji..." else "Transcribing file..."
+        if (resumeFrom != null) {
+            _confirmedText.value = resumeFrom.accumulatedText
+        }
 
         // File decode can be CPU-heavy (especially omnilingual); keep it off main.
         fileTranscriptionJob = scope.launch(Dispatchers.Default) {
+            var checkpointCleared = false
             try {
                 Log.i("WhisperEngine", "transcribeFile: reading $filePath")
                 val audioSamples = withContext(Dispatchers.IO) {
@@ -829,17 +881,78 @@ class WhisperEngine(
                 audioRecorder.injectSamples(audioSamples)
                 _bufferSeconds.value = durationSec
                 _bufferEnergy.value = audioRecorder.relativeEnergy
+                _fileTranscriptionProgress.value = 0f
 
                 val startTime = System.nanoTime()
                 val numThreads = Runtime.getRuntime().availableProcessors().coerceAtMost(4).coerceAtLeast(1)
                 Log.i("WhisperEngine", "transcribeFile: starting transcription with $numThreads threads")
-                val segments = if (engine is AndroidSpeechEngine && Build.VERSION.SDK_INT < 33 && e2eLocked) {
+
+                // Process long files in windows so the UI can show progressively-arriving
+                // text (like a live transcript) plus an accurate progress bar, instead of
+                // blocking silently until the entire file is done. Each completed window
+                // is also checkpointed to disk so a crash can resume from here.
+                val segments = mutableListOf<TranscriptionSegment>()
+                if (resumeFrom != null) {
+                    segments += TranscriptionCheckpointStore.deserializeSegments(resumeFrom.segmentsJson)
+                }
+                if (engine is AndroidSpeechEngine && Build.VERSION.SDK_INT < 33 && e2eLocked) {
                     // On API < 33, SpeechRecognizer can't accept file audio directly.
                     // For E2E benchmarks, attempt acoustic loopback (speaker -> mic).
+                    // This path is a single whole-file call (no chunking / progress / resume).
                     Log.i("WhisperEngine", "transcribeFile: Android Speech API<33, using acoustic loopback")
-                    engine.transcribeViaAcousticLoopback(audioSamples, languageHint)
+                    segments += engine.transcribeViaAcousticLoopback(audioSamples, languageHint)
+                    _fileTranscriptionProgress.value = 1f
                 } else {
-                    engine.transcribe(audioSamples, numThreads, languageHint)
+                    val chunkDurationSec = 20.0
+                    val chunkSizeSamples = (chunkDurationSec * AudioConstants.SAMPLE_RATE).toInt()
+                        .coerceAtLeast(1)
+                    val totalSamples = audioSamples.size
+                    var chunksDone = resumeFrom?.processedChunks ?: 0
+                    var offsetSamples = (chunksDone * chunkSizeSamples).coerceAtMost(totalSamples)
+                    if (offsetSamples > 0) {
+                        // Reflect the resumed starting point immediately, instead of
+                        // briefly showing 0% right after a crash-resume.
+                        _fileTranscriptionProgress.value =
+                            (offsetSamples.toFloat() / totalSamples.toFloat()).coerceIn(0f, 1f)
+                    }
+                    while (offsetSamples < totalSamples) {
+                        ensureActive()
+                        val end = (offsetSamples + chunkSizeSamples).coerceAtMost(totalSamples)
+                        val chunk = audioSamples.copyOfRange(offsetSamples, end)
+                        val chunkOffsetMs = (offsetSamples * 1000L) / AudioConstants.SAMPLE_RATE
+
+                        val chunkSegments = engine.transcribe(chunk, numThreads, languageHint)
+                            .map { it.copy(startMs = it.startMs + chunkOffsetMs, endMs = it.endMs + chunkOffsetMs) }
+                        segments += chunkSegments
+                        chunksDone += 1
+
+                        // Render everything accumulated so far so the transcript visibly
+                        // grows chunk by chunk, similar to live-recording token streaming.
+                        chunkManager.confirmedSegments.clear()
+                        chunkManager.confirmedSegments.addAll(segments)
+                        val partialText = chunkManager.renderSegmentsText(segments)
+                        chunkManager.confirmedText = partialText
+                        _confirmedText.value = partialText
+
+                        offsetSamples = end
+                        _fileTranscriptionProgress.value =
+                            (offsetSamples.toFloat() / totalSamples.toFloat()).coerceIn(0f, 1f)
+                        _hypothesisText.value = "Transcribing... ${(_fileTranscriptionProgress.value * 100).toInt()}%"
+
+                        // Checkpoint after every completed chunk so a crash can resume here.
+                        checkpointStore.saveFileCheckpoint(
+                            TranscriptionCheckpointStore.FileCheckpoint(
+                                wavFilePath = filePath,
+                                languageHint = languageHint,
+                                cassetteId = cassetteId,
+                                processedChunks = chunksDone,
+                                accumulatedText = partialText,
+                                segmentsJson = TranscriptionCheckpointStore.serializeSegments(segments),
+                                attemptStartChunk = resumeFrom?.attemptStartChunk ?: 0,
+                                attemptCount = resumeFrom?.attemptCount ?: 0
+                            )
+                        )
+                    }
                 }
 
                 val elapsed = (System.nanoTime() - startTime) / 1_000_000_000.0
@@ -855,11 +968,16 @@ class WhisperEngine(
                     applyDetectedLanguageToTranslation(lang)
                 }
 
+                chunkManager.confirmedSegments.clear()
                 chunkManager.confirmedSegments.addAll(segments)
                 val renderedText = chunkManager.renderSegmentsText(segments)
                 chunkManager.confirmedText = renderedText
                 _confirmedText.value = renderedText
                 _hypothesisText.value = ""
+                _fileTranscriptionProgress.value = 1f
+                // Finished successfully end-to-end: no need to resume this file anymore.
+                checkpointStore.clearFileCheckpoint()
+                checkpointCleared = true
                 val model = _selectedModel.value
                 val skipReason = when {
                     model.engineType == EngineType.ANDROID_SPEECH &&
@@ -898,9 +1016,14 @@ class WhisperEngine(
                 )
             } catch (e: CancellationException) {
                 Log.i("WhisperEngine", "transcribeFile: cancelled")
+                // Intentional stop (user action), not a crash — don't auto-resume next launch.
+                if (!checkpointCleared) checkpointStore.clearFileCheckpoint()
             } catch (e: Throwable) {
                 Log.e("WhisperEngine", "transcribeFile failed", e)
                 _lastError.value = AppError.TranscriptionFailed(e)
+                // A caught (non-fatal) exception already surfaced an error to the user;
+                // leave checkpoint clearing to shouldAutoResume()'s retry budget instead
+                // of wiping it immediately, so a transient failure can still retry once.
                 e2eOrchestrator.writeResult(
                     transcript = "",
                     durationMs = 0.0,
