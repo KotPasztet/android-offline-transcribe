@@ -9,9 +9,11 @@ import androidx.lifecycle.viewModelScope
 import com.voiceping.offlinetranscription.data.cassette.CassetteEntity
 import com.voiceping.offlinetranscription.data.cassette.CassetteRepository
 import com.voiceping.offlinetranscription.data.cassette.MemoEntity
+import com.voiceping.offlinetranscription.service.SessionState
 import com.voiceping.offlinetranscription.service.WhisperEngine
 import com.voiceping.offlinetranscription.util.AudioDecodeUtils
 import com.voiceping.offlinetranscription.util.CassetteAudioStorage
+import com.voiceping.offlinetranscription.util.PendingShareHolder
 import com.voiceping.offlinetranscription.util.TranscriptionCheckpointStore
 import com.voiceping.offlinetranscription.util.WavWriter
 import kotlinx.coroutines.Job
@@ -32,6 +34,7 @@ class CassetteViewModel(
     // Live engine state, reused directly (same as TranscriptionViewModel)
     // so recording / model switching / live tokens all "just work" here too.
     val isRecording = engine.isRecording
+    val sessionState = engine.sessionState
     val confirmedText = engine.confirmedText
     val hypothesisText = engine.hypothesisText
     val bufferEnergy = engine.bufferEnergy
@@ -44,6 +47,16 @@ class CassetteViewModel(
 
     val memos: StateFlow<List<MemoEntity>> = repository.observeMemos(cassetteId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    init {
+        // If this cassette screen was opened because the user picked it in
+        // the "share a file into a cassette" dialog, pick up and consume
+        // that pending file now.
+        PendingShareHolder.pendingAudioUri?.let { uri ->
+            PendingShareHolder.pendingAudioUri = null
+            importFileAsMemo(uri)
+        }
+    }
 
     private var mediaPlayer: MediaPlayer? = null
     private var recordingFlushJob: Job? = null
@@ -60,10 +73,25 @@ class CassetteViewModel(
         recordingFlushJob = viewModelScope.launch {
             while (true) {
                 delay(RECORDING_CHECKPOINT_INTERVAL_MS)
-                if (!engine.isRecording.value) break
-                flushRecordingCheckpoint()
+                if (engine.sessionState.value == SessionState.Idle) break
+                if (engine.sessionState.value == SessionState.Recording) {
+                    flushRecordingCheckpoint()
+                }
             }
         }
+    }
+
+    /** Pauses the current recording — mic stops, but the memo-in-progress isn't finalized. */
+    fun pauseRecording() {
+        viewModelScope.launch {
+            engine.pauseRecording()
+            flushRecordingCheckpoint()
+        }
+    }
+
+    /** Resumes a paused recording, continuing the same memo-in-progress. */
+    fun resumeRecording() {
+        engine.resumeRecording()
     }
 
     private fun flushRecordingCheckpoint() {
@@ -183,6 +211,35 @@ class CassetteViewModel(
         viewModelScope.launch {
             repository.deleteMemo(memo)
             CassetteAudioStorage.deleteMemoFile(memo.audioFilePath)
+        }
+    }
+
+    /**
+     * Bundles the whole cassette (all memo audio + a combined transcript)
+     * into a .zip and opens the system Share sheet for it.
+     */
+    fun exportAndShareCassette() {
+        viewModelScope.launch {
+            try {
+                val currentCassette = cassette.value ?: repository.getCassette(cassetteId) ?: return@launch
+                val currentMemos = memos.value
+                val uri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.voiceping.offlinetranscription.util.CassetteExporter.exportCassette(
+                        context, currentCassette, currentMemos
+                    )
+                }
+                val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val chooser = android.content.Intent.createChooser(shareIntent, "Udostępnij kasetę")
+                chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(chooser)
+            } catch (e: Exception) {
+                Log.e("CassetteViewModel", "exportAndShareCassette failed", e)
+            }
         }
     }
 

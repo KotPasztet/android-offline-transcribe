@@ -21,6 +21,64 @@ To jest PEŁNE repo `android-offline-transcribe` (razem z submodułem
 - Żywe nagrywanie: zrzut co 5s, po crashu odzyskiwane jako gotowe memo (nie da się dosłownie wznowić mikrofonu po śmierci procesu)
 - **Zabezpieczenie przed pętlą**: jeśli wznowienie utknie w tym samym miejscu >2 razy, albo przy powtórce zebrany tekst ma <5 słów — appka porzuca checkpoint zamiast próbować w kółko przy każdym starcie. Progi do zmiany: `MAX_RETRIES_AT_SAME_CHUNK`, `MIN_WORDS_TO_TRUST_PROGRESS` w `TranscriptionCheckpointStore.kt`.
 
+## Faza 4 — poprawki UX (pułapka w ustawieniach, rozwijanie, kopiowanie)
+- Wejście w ustawienia nie wyładowuje już modelu z góry — tylko przy
+  faktycznej zmianie na inny.
+- `ModelSetupScreen` ma przycisk wstecz, gdy jest dokąd wracać.
+- Transkrypt memo na liście: dotknięcie rozwija/zwija pełny tekst.
+- Przycisk kopiowania (schowek) przy każdym memo i na karcie live-transkryptu.
+
+## Faza 5 — crash na długich plikach, pauza, share-into-app, eksport kasety
+
+**Prawdziwa przyczyna crasha na 30-minutowym audio (znaleziona i naprawiona):**
+`AudioRecorder.audioBuffer` był typu `ArrayList<Float>` — to bug z
+oryginalnego kodu voiceping, nie coś wprowadzonego przeze mnie. Każda
+próbka dźwięku była boxowana jako osobny obiekt `java.lang.Float`. Dla 30
+minut przy 16kHz to ~29 milionów obiektów = ponad pół giga zbędnego
+narzutu pamięci = gwarantowany OutOfMemoryError. Do tego `readWavFile`
+ładował cały plik do RAM podwójnie (bajty + floaty).
+
+Naprawione:
+- `util/GrowableFloatArray.kt`, `util/GrowableShortArray.kt` — niebogowane,
+  rosnące bufory oparte na surowych tablicach, zastępują `ArrayList<Float>`
+  w `AudioRecorder` i `mutableListOf<Short>()` w dekodowaniu m4a/mp3.
+- `WhisperEngine.transcribeFile` przepisany na **prawdziwy streaming**:
+  `readWavHeader()` + `readWavChunk()` czytają plik fragmentami wprost
+  z dysku zamiast ładować całość na raz — działa teraz dla plików
+  dowolnej długości.
+- `android:largeHeap="true"` jako dodatkowy margines bezpieczeństwa.
+
+**Pauza/wznowienie nagrywania:**
+- Nowy stan `SessionState.Paused` + `pauseRecording()`/`resumeRecording()`
+  w `WhisperEngine` — wykorzystuje fakt, że postęp jest już śledzony przez
+  bezwzględny licznik próbek (nie resetuje się), więc wznowienie kontynuuje
+  ten sam bufor/transkrypt zamiast zaczynać od nowa.
+- Nowy przycisk pauzy/wznowienia na ekranie kasety.
+
+**Udostępnianie pliku z innej aplikacji (Share):**
+- Manifest: `intent-filter` na `ACTION_SEND` dla `audio/*` + `singleTask`.
+- `MainActivity` przechwytuje URI, `util/PendingShareHolder.kt` trzyma go
+  tymczasowo, `ui/cassette/ChooseCassetteDialog.kt` pyta do której kasety
+  (albo utwórz nową), `CassetteViewModel` konsumuje i importuje.
+
+**Eksport całej kasety:**
+- `util/CassetteExporter.kt` — pakuje wszystkie nagrania audio + wspólny
+  plik `transkrypcja.txt` do jednego .zip, udostępnianego przez systemowy
+  Share sheet (przycisk ikony udostępniania w pasku górnym ekranu kasety).
+
+## Ograniczenia tej fazy
+- Pauza/wznowienie nie było testowane na urządzeniu (brak tu Android SDK) —
+  logika oparta jest na już istniejącym w kodzie mechanizmie śledzenia
+  postępu przez bezwzględny licznik próbek, ale realny build może ujawnić
+  drobiazg w wątkach/coroutines.
+- Dekodowanie m4a/mp3 nadal trzyma cały zdekodowany sygnał w pamięci na
+  raz (teraz jako niebogowane tablice, nie boxowaną listę) — dla bardzo
+  długich plików (>1h) to nadal spory szczyt pamięci (~200MB+), ale
+  nieporównywalnie lepszy niż wcześniejszy stan (700MB+ i gwarantowany
+  crash). Prawdziwy pełny streaming dekodowania m4a byłby kolejnym krokiem,
+  jeśli nadal będzie to problem.
+
+
 ## Budowanie — zalecane: GitHub Actions (nie Termux)
 
 Ten projekt ma natywne C++/CMake/NDK (whisper.cpp, sherpa-onnx) —
