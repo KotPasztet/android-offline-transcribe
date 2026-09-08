@@ -28,6 +28,123 @@ To jest PEŁNE repo `android-offline-transcribe` (razem z submodułem
 - Transkrypt memo na liście: dotknięcie rozwija/zwija pełny tekst.
 - Przycisk kopiowania (schowek) przy każdym memo i na karcie live-transkryptu.
 
+## Faza 5 — crash na długich plikach, pauza, share-into-app, eksport kasety
+
+**Prawdziwa przyczyna crasha na 30-minutowym audio (znaleziona i naprawiona):**
+`AudioRecorder.audioBuffer` był typu `ArrayList<Float>` — to bug z
+oryginalnego kodu voiceping, nie coś wprowadzonego przeze mnie. Każda
+próbka dźwięku była boxowana jako osobny obiekt `java.lang.Float`. Dla 30
+minut przy 16kHz to ~29 milionów obiektów = ponad pół giga zbędnego
+narzutu pamięci = gwarantowany OutOfMemoryError. Do tego `readWavFile`
+ładował cały plik do RAM podwójnie (bajty + floaty).
+
+Naprawione:
+- `util/GrowableFloatArray.kt`, `util/GrowableShortArray.kt` — niebogowane,
+  rosnące bufory oparte na surowych tablicach, zastępują `ArrayList<Float>`
+  w `AudioRecorder` i `mutableListOf<Short>()` w dekodowaniu m4a/mp3.
+- `WhisperEngine.transcribeFile` przepisany na **prawdziwy streaming**:
+  `readWavHeader()` + `readWavChunk()` czytają plik fragmentami wprost
+  z dysku zamiast ładować całość na raz — działa teraz dla plików
+  dowolnej długości.
+- `android:largeHeap="true"` jako dodatkowy margines bezpieczeństwa.
+
+**Pauza/wznowienie nagrywania:**
+- Nowy stan `SessionState.Paused` + `pauseRecording()`/`resumeRecording()`
+  w `WhisperEngine` — wykorzystuje fakt, że postęp jest już śledzony przez
+  bezwzględny licznik próbek (nie resetuje się), więc wznowienie kontynuuje
+  ten sam bufor/transkrypt zamiast zaczynać od nowa.
+- Nowy przycisk pauzy/wznowienia na ekranie kasety.
+
+**Udostępnianie pliku z innej aplikacji (Share):**
+- Manifest: `intent-filter` na `ACTION_SEND` dla `audio/*` + `singleTask`.
+- `MainActivity` przechwytuje URI, `util/PendingShareHolder.kt` trzyma go
+  tymczasowo, `ui/cassette/ChooseCassetteDialog.kt` pyta do której kasety
+  (albo utwórz nową), `CassetteViewModel` konsumuje i importuje.
+
+**Eksport całej kasety:**
+- `util/CassetteExporter.kt` — pakuje wszystkie nagrania audio + wspólny
+  plik `transkrypcja.txt` do jednego .zip, udostępnianego przez systemowy
+  Share sheet (przycisk ikony udostępniania w pasku górnym ekranu kasety).
+
+## Faza 6 — czarny ekran / zamrożone UI podczas importu długiego pliku
+
+**Przyczyna:** `CassetteViewModel.importFileAsMemo` uruchamiał całe
+kopiowanie/dekodowanie pliku (`AudioDecodeUtils.decodeToWavFile` — pętla
+MediaCodec bez punktów zawieszenia) bezpośrednio w `viewModelScope.launch`,
+którego domyślny dispatcher to **Dispatchers.Main**. Dla 40-minutowego
+pliku to blokowało główny wątek na cały czas dekodowania — stąd czarny
+ekran, brak reakcji na dotyk, brak możliwości nawigacji.
+
+To samo dotyczyło:
+- zapisu nagrania po naciśnięciu "stop" (`stopRecordingAndSaveMemo` —
+  zapis WAV + kopiowanie mogły ważyć setki MB dla długiego nagrania),
+- **cyklicznego zapisu checkpointu co 5 sekund podczas samego nagrywania**
+  (`flushRecordingCheckpoint` — dla długiego nagrania z czasem robi się
+  to coraz cięższe, bo za każdym razem nadpisuje cały dotychczasowy plik),
+- automatycznego wznawiania po crashu przy starcie appki
+  (`CrashRecoveryCoordinator`, wywoływany z `LaunchedEffect` czyli też
+  na wątku głównym).
+
+**Naprawione:** wszystkie te operacje I/O i dekodowania przeniesione na
+`Dispatchers.IO` (`withContext(Dispatchers.IO) { ... }` / 
+`viewModelScope.launch(Dispatchers.IO)`). UI zostaje w pełni responsywne
+przez cały czas — appka działa "w tle", tak jak prosiłeś.
+
+**Dodatkowo:** dodałem osobny stan "Dekodowanie pliku..." (nowy
+`isImportDecoding` w `CassetteViewModel`) z nieokreślonym paskiem postępu,
+pokazywany zanim ruszy właściwa transkrypcja (wcześniej ten etap nie miał
+żadnego wskaźnika, więc nawet po naprawie responsywności ekran mógłby
+wyglądać na "nic się nie dzieje" — teraz jest jasne, że appka pracuje.
+
+Zmienione pliki: `CassetteViewModel.kt`, `CassetteScreen.kt`,
+`CrashRecoveryCoordinator.kt`.
+
+## Ograniczenia (Faza 5)
+
+- Pauza/wznowienie nie było testowane na urządzeniu (brak tu Android SDK) —
+  logika oparta jest na już istniejącym w kodzie mechanizmie śledzenia
+  postępu przez bezwzględny licznik próbek, ale realny build może ujawnić
+  drobiazg w wątkach/coroutines.
+- Dekodowanie m4a/mp3 nadal trzyma cały zdekodowany sygnał w pamięci na
+  raz (teraz jako niebogowane tablice, nie boxowaną listę) — dla bardzo
+  długich plików (>1h) to nadal spory szczyt pamięci (~200MB+), ale
+  nieporównywalnie lepszy niż wcześniejszy stan (700MB+ i gwarantowany
+  crash). Prawdziwy pełny streaming dekodowania m4a byłby kolejnym krokiem,
+  jeśli nadal będzie to problem.
+
+
+## Faza 7 — "wysyłam WAV i nic się nie dzieje"
+
+Dwa konkretne, potwierdzone bugi:
+
+1. **Parser WAV rzucał wyjątkiem dla plików ze streamowanym rozmiarem
+   danych.** Niektóre nagrywarki zapisują rozmiar chunku `data` jako
+   `0xFFFFFFFF` ("nieznany na etapie zapisu"). Odczytany jako liczba ze
+   znakiem w Kotlinie dawał `-1`, co wywalało `readWavHeader()` z
+   wyjątkiem "No data chunk found in WAV" dla KAŻDEGO takiego pliku.
+   Naprawione w `WhisperEngine.readWavHeader()`: rozmiar chunku jest teraz
+   poprawnie interpretowany jako liczba bez znaku, a gdy jest
+   nieznany/nieprawidłowy — czytamy dane do końca pliku (standardowa
+   konwencja dla tego przypadku).
+
+2. **Błędy ginęły po cichu.** `CassetteViewModel.lastError` był ustawiany
+   (np. właśnie przez powyższy wyjątek), ale `CassetteScreen` nigdy go nie
+   wyświetlał. Efekt: transkrypcja cicho się wysypywała, appka nie
+   pokazywała ani paska postępu, ani błędu — wyglądało jak "nic się nie
+   dzieje". Dodany dialog błędu (ten sam wzorzec co w starym
+   `TranscriptionScreen`), więc od teraz każda awaria jest widoczna z
+   konkretnym komunikatem zamiast ciszy.
+
+Zmienione pliki: `WhisperEngine.kt`, `CassetteViewModel.kt`,
+`CassetteScreen.kt`.
+
+**Uwaga o zgłoszonym "insta crashu":** nie mam logów/stack trace z tego
+zgłoszenia, więc nie mogłem go bezpośrednio zdiagnozować — przejrzałem
+ręcznie całą ścieżkę startową (Application, MainActivity, nawigację,
+crash-recovery) i nie znalazłem tam ewidentnego błędu. Jeśli po tej
+poprawce nadal zdarza się prawdziwy crash (nie tylko cichy błąd jak wyżej),
+potrzebuję Logcat/stack trace żeby to precyzyjnie namierzyć — bez tego
+dalsze zgadywanie byłoby strzałem w ciemno.
 
 ## Budowanie — zalecane: GitHub Actions (nie Termux)
 

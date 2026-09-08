@@ -5,7 +5,9 @@ import android.util.Log
 import com.voiceping.offlinetranscription.data.cassette.CassetteRepository
 import com.voiceping.offlinetranscription.service.WhisperEngine
 import com.voiceping.offlinetranscription.util.CassetteAudioStorage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -30,8 +32,13 @@ object CrashRecoveryCoordinator {
     private const val TAG = "CrashRecoveryCoordinator"
 
     suspend fun recoverIfNeeded(context: Context, engine: WhisperEngine, repository: CassetteRepository) {
-        recoverInterruptedRecording(context, engine, repository)
-        recoverInterruptedFileImport(context, engine, repository)
+        // This is invoked from a Compose LaunchedEffect (Main dispatcher). Recovery
+        // can involve copying/reading potentially large audio files — do that off
+        // the main thread so a crash-recovery on startup can't itself freeze the UI.
+        withContext(Dispatchers.IO) {
+            recoverInterruptedRecording(context, engine, repository)
+            recoverInterruptedFileImport(context, engine, repository)
+        }
     }
 
     private suspend fun recoverInterruptedRecording(

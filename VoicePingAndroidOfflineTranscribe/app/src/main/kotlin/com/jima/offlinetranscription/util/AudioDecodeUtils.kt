@@ -75,7 +75,7 @@ object AudioDecodeUtils {
             codec.configure(format, null, null, 0)
             codec.start()
 
-            val rawMono = mutableListOf<Short>() // interleaved-free, already downmixed mono, at inputSampleRate
+            val rawMono = GrowableShortArray(inputSampleRate * 60) // pre-size ~1 min at native rate
             val bufferInfo = MediaCodec.BufferInfo()
             var sawInputEOS = false
             var sawOutputEOS = false
@@ -144,7 +144,7 @@ object AudioDecodeUtils {
                 codec.release()
             }
 
-            val monoAtInputRate = ShortArray(rawMono.size) { rawMono[it] }
+            val monoAtInputRate = rawMono.toShortArray()
             val resampled = resampleTo16k(monoAtInputRate, inputSampleRate)
             return FloatArray(resampled.size) { resampled[it] / 32768f }
         } finally {

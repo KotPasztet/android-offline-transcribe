@@ -36,6 +36,7 @@ data class TranscriptionSegment(
 enum class SessionState {
     Idle,       // No recording, ready to start
     Recording,  // Mic active, transcription loop running
+    Paused,     // Recording paused: mic stopped, buffer/transcript kept, can resume
     Stopping,   // Stop requested, waiting for jobs to complete
     Error       // Error occurred, needs clearTranscription() to reset
 }
@@ -618,7 +619,7 @@ class WhisperEngine(
     }
 
     fun stopRecording() {
-        if (_sessionState.value != SessionState.Recording) return
+        if (_sessionState.value != SessionState.Recording && _sessionState.value != SessionState.Paused) return
         transitionTo(SessionState.Stopping)
         // Cancel file transcription if running (transcribeFile uses fileTranscriptionJob)
         fileTranscriptionJob?.cancel()
@@ -651,7 +652,7 @@ class WhisperEngine(
     }
 
     private suspend fun stopRecordingAndWait() {
-        if (_sessionState.value != SessionState.Recording) return
+        if (_sessionState.value != SessionState.Recording && _sessionState.value != SessionState.Paused) return
         transitionTo(SessionState.Stopping)
         fileTranscriptionJob?.cancelAndJoin()
         fileTranscriptionJob = null
@@ -675,6 +676,83 @@ class WhisperEngine(
         invalidateSession()
         transcriptionCoordinator.cancelTranscriptionJobAndWait()
         transitionTo(SessionState.Idle)
+    }
+
+    /**
+     * Pauses an in-progress recording: stops the microphone and the
+     * transcription loop, but — unlike [stopRecording] — keeps the audio
+     * buffer and transcript intact so [resumeRecording] can continue the
+     * same memo instead of starting a new one.
+     *
+     * The underlying architecture already tracks progress via absolute
+     * sample counts (not a per-session reset), so resuming naturally only
+     * transcribes newly-captured audio rather than re-processing anything.
+     */
+    suspend fun pauseRecording() {
+        if (_sessionState.value != SessionState.Recording) return
+        // Flip state before cancelling the loop so its own finally-block
+        // doesn't also try to transition to Idle (it only does that while
+        // isSessionActive() — which requires state == Recording — is true).
+        transitionTo(SessionState.Paused)
+        audioRecorder.stopRecording()
+        cancelRecorderAndEnergyJobsAndWait()
+
+        if (currentEngine?.isStreaming == true) {
+            transcriptionCoordinator.drainFinalStreamingAudioIfNeeded()
+        }
+        // Let the realtime loop's finally block (final transcription pass +
+        // finalizeCurrentChunk) finish flushing hypothesis text into confirmed
+        // text before we report "paused" to the UI.
+        transcriptionCoordinator.cancelTranscriptionJobAndWait()
+        invalidateSession()
+    }
+
+    /**
+     * Resumes a paused recording. Deliberately does NOT call
+     * [resetTranscriptionState] — the whole point is to keep the audio
+     * buffer and transcript from before the pause.
+     */
+    fun resumeRecording() {
+        if (_sessionState.value != SessionState.Paused) return
+        val engine = currentEngine
+        if (engine == null || !engine.isLoaded) {
+            Log.e("WhisperEngine", "resumeRecording: model not ready")
+            _lastError.value = AppError.ModelNotReady()
+            transitionTo(SessionState.Error)
+            return
+        }
+        if (!audioRecorder.hasPermission()) {
+            Log.e("WhisperEngine", "resumeRecording: no mic permission")
+            _lastError.value = AppError.MicrophonePermissionDenied()
+            transitionTo(SessionState.Error)
+            return
+        }
+
+        transitionTo(SessionState.Recording)
+        val activeSessionToken = nextSessionToken()
+
+        recordingJob = scope.launch(Dispatchers.IO) {
+            try {
+                if (!isSessionActive(activeSessionToken)) return@launch
+                audioRecorder.startRecording(_audioInputMode.value)
+            } catch (e: Throwable) {
+                if (!isSessionActive(activeSessionToken)) return@launch
+                withContext(Dispatchers.Main) {
+                    _lastError.value = AppError.TranscriptionFailed(e)
+                    transitionTo(SessionState.Error)
+                }
+            }
+        }
+
+        transcriptionCoordinator.startLoop(scope, activeSessionToken, engine)
+
+        energyJob = scope.launch(Dispatchers.Default) {
+            while (isSessionActive(activeSessionToken)) {
+                _bufferEnergy.value = audioRecorder.relativeEnergy
+                _bufferSeconds.value = audioRecorder.bufferSeconds
+                delay(100)
+            }
+        }
     }
 
     private fun cancelRecorderAndEnergyJobs() {
@@ -870,17 +948,19 @@ class WhisperEngine(
         fileTranscriptionJob = scope.launch(Dispatchers.Default) {
             var checkpointCleared = false
             try {
-                Log.i("WhisperEngine", "transcribeFile: reading $filePath")
-                val audioSamples = withContext(Dispatchers.IO) {
-                    readWavFile(filePath)
-                }
-                val durationSec = audioSamples.size / AudioConstants.SAMPLE_RATE.toDouble()
-                Log.i("WhisperEngine", "transcribeFile: ${audioSamples.size} samples (${durationSec}s)")
+                Log.i("WhisperEngine", "transcribeFile: reading header for $filePath")
+                // Only the header is parsed up front — actual sample data is read
+                // chunk-by-chunk further down. Loading a whole 30+ minute WAV into
+                // one FloatArray (plus a full-file ByteArray read before that) is
+                // exactly what used to crash the app with OutOfMemoryError.
+                val wavInfo = withContext(Dispatchers.IO) { readWavHeader(filePath) }
+                val totalSamples = wavInfo.sampleCount
+                val durationSec = totalSamples / AudioConstants.SAMPLE_RATE.toDouble()
+                Log.i("WhisperEngine", "transcribeFile: $totalSamples samples (${durationSec}s)")
                 _hypothesisText.value = "Transcribing ${"%.1f".format(durationSec)}s of audio..."
 
-                audioRecorder.injectSamples(audioSamples)
                 _bufferSeconds.value = durationSec
-                _bufferEnergy.value = audioRecorder.relativeEnergy
+                _bufferEnergy.value = emptyList()
                 _fileTranscriptionProgress.value = 0f
 
                 val startTime = System.nanoTime()
@@ -890,7 +970,9 @@ class WhisperEngine(
                 // Process long files in windows so the UI can show progressively-arriving
                 // text (like a live transcript) plus an accurate progress bar, instead of
                 // blocking silently until the entire file is done. Each completed window
-                // is also checkpointed to disk so a crash can resume from here.
+                // is also checkpointed to disk so a crash can resume from here. Reading
+                // each window straight from disk (instead of one giant in-memory array)
+                // is what actually lets this handle arbitrarily long files.
                 val segments = mutableListOf<TranscriptionSegment>()
                 if (resumeFrom != null) {
                     segments += TranscriptionCheckpointStore.deserializeSegments(resumeFrom.segmentsJson)
@@ -898,15 +980,17 @@ class WhisperEngine(
                 if (engine is AndroidSpeechEngine && Build.VERSION.SDK_INT < 33 && e2eLocked) {
                     // On API < 33, SpeechRecognizer can't accept file audio directly.
                     // For E2E benchmarks, attempt acoustic loopback (speaker -> mic).
-                    // This path is a single whole-file call (no chunking / progress / resume).
+                    // This path is a single whole-file call (no chunking / progress / resume) —
+                    // only exercised by short internal benchmark clips, not real user imports.
                     Log.i("WhisperEngine", "transcribeFile: Android Speech API<33, using acoustic loopback")
-                    segments += engine.transcribeViaAcousticLoopback(audioSamples, languageHint)
+                    val wholeFile = withContext(Dispatchers.IO) { readWavFile(filePath) }
+                    audioRecorder.injectSamples(wholeFile)
+                    segments += engine.transcribeViaAcousticLoopback(wholeFile, languageHint)
                     _fileTranscriptionProgress.value = 1f
                 } else {
                     val chunkDurationSec = 20.0
                     val chunkSizeSamples = (chunkDurationSec * AudioConstants.SAMPLE_RATE).toInt()
                         .coerceAtLeast(1)
-                    val totalSamples = audioSamples.size
                     var chunksDone = resumeFrom?.processedChunks ?: 0
                     var offsetSamples = (chunksDone * chunkSizeSamples).coerceAtMost(totalSamples)
                     if (offsetSamples > 0) {
@@ -915,16 +999,27 @@ class WhisperEngine(
                         _fileTranscriptionProgress.value =
                             (offsetSamples.toFloat() / totalSamples.toFloat()).coerceIn(0f, 1f)
                     }
+                    val recentEnergy = ArrayDeque<Float>()
                     while (offsetSamples < totalSamples) {
                         ensureActive()
                         val end = (offsetSamples + chunkSizeSamples).coerceAtMost(totalSamples)
-                        val chunk = audioSamples.copyOfRange(offsetSamples, end)
+                        val chunk = withContext(Dispatchers.IO) {
+                            readWavChunk(filePath, wavInfo, offsetSamples, end - offsetSamples)
+                        }
                         val chunkOffsetMs = (offsetSamples * 1000L) / AudioConstants.SAMPLE_RATE
 
                         val chunkSegments = engine.transcribe(chunk, numThreads, languageHint)
                             .map { it.copy(startMs = it.startMs + chunkOffsetMs, endMs = it.endMs + chunkOffsetMs) }
                         segments += chunkSegments
                         chunksDone += 1
+
+                        // Cheap per-chunk RMS for the waveform visualizer, without ever
+                        // holding the whole file's samples in memory at once.
+                        var sumSquares = 0.0
+                        for (s in chunk) sumSquares += s * s
+                        recentEnergy.addLast(kotlin.math.sqrt(sumSquares / chunk.size.coerceAtLeast(1)).toFloat())
+                        while (recentEnergy.size > AudioConstants.MAX_ENERGY_HISTORY_SIZE) recentEnergy.removeFirst()
+                        _bufferEnergy.value = recentEnergy.toList()
 
                         // Render everything accumulated so far so the transcript visibly
                         // grows chunk by chunk, similar to live-recording token streaming.
@@ -1176,6 +1271,117 @@ class WhisperEngine(
             _translatedHypothesisText.value = TextNormalizationUtils.normalizeText(translatedHypothesis)
             _translationWarning.value = warningMessage
             lastTranslationInput = currentInput
+        }
+    }
+
+    /** Minimal WAV header info needed to read the file chunk-by-chunk without loading it whole. */
+    private data class WavInfo(
+        val sampleRate: Int,
+        val channels: Int,
+        val bitsPerSample: Int,
+        val dataOffset: Long,
+        val sampleCount: Int
+    )
+
+    /**
+     * Parses just the WAV header (RIFF/fmt/data chunk locations), never
+     * reading the (potentially huge) sample data itself into memory.
+     */
+    private fun readWavHeader(filePath: String): WavInfo {
+        java.io.RandomAccessFile(filePath, "r").use { raf ->
+            val fileLength = raf.length()
+            val header = ByteArray(12)
+            raf.readFully(header)
+            val riff = String(header, 0, 4, Charsets.US_ASCII)
+            if (riff != "RIFF") throw Exception("Not a RIFF file")
+            val wave = String(header, 8, 4, Charsets.US_ASCII)
+            if (wave != "WAVE") throw Exception("Not a WAVE file")
+
+            var bitsPerSample = 16
+            var channels = 1
+            var sampleRate = AudioConstants.SAMPLE_RATE
+            var dataOffset = -1L
+            var dataSize = -1L
+
+            var pos = 12L
+            val chunkHeader = ByteArray(8)
+            while (pos + 8 <= fileLength) {
+                raf.seek(pos)
+                raf.readFully(chunkHeader)
+                val chunkId = String(chunkHeader, 0, 4, Charsets.US_ASCII)
+                val chunkSize = java.nio.ByteBuffer.wrap(chunkHeader, 4, 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+                if (chunkId == "fmt " && pos + 8 + chunkSize <= fileLength) {
+                    val fmtBytes = ByteArray(chunkSize)
+                    raf.seek(pos + 8)
+                    raf.readFully(fmtBytes)
+                    val buf = java.nio.ByteBuffer.wrap(fmtBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    buf.short // audioFormat
+                    channels = buf.short.toInt()
+                    sampleRate = buf.int
+                    buf.int // byteRate
+                    buf.short // blockAlign
+                    bitsPerSample = buf.short.toInt()
+                } else if (chunkId == "data") {
+                    dataOffset = pos + 8
+                    // chunkSize is a 32-bit field; some encoders write it as
+                    // 0xFFFFFFFF ("unknown/streaming size"), which reads back
+                    // as -1 in a signed Int and would otherwise make us think
+                    // there's no data at all. Reinterpret as unsigned, and
+                    // fall back to "rest of file" if it's missing/bogus.
+                    val declaredSize = chunkSize.toLong() and 0xFFFFFFFFL
+                    val remainingInFile = fileLength - dataOffset
+                    dataSize = if (declaredSize <= 0 || declaredSize > remainingInFile) {
+                        remainingInFile
+                    } else {
+                        declaredSize
+                    }
+                    break
+                }
+                pos += 8 + chunkSize
+                if (chunkSize % 2 != 0) pos++ // RIFF chunks are word-aligned
+            }
+
+            if (dataOffset < 0 || dataSize <= 0) throw Exception("No data chunk found in WAV")
+            val bytesPerSample = (bitsPerSample / 8).coerceAtLeast(1)
+            val sampleCount = (dataSize / (bytesPerSample * channels)).toInt()
+            Log.i("WhisperEngine", "WAV header: ${sampleRate}Hz ${channels}ch ${bitsPerSample}bit samples=$sampleCount")
+            return WavInfo(sampleRate, channels, bitsPerSample, dataOffset, sampleCount)
+        }
+    }
+
+    /**
+     * Reads just [sampleCount] samples starting at [sampleOffset] directly
+     * from disk (mono-downmixed to the first channel, matching the original
+     * whole-file reader's behavior) — never touches samples outside this window.
+     */
+    private fun readWavChunk(filePath: String, info: WavInfo, sampleOffset: Int, sampleCount: Int): FloatArray {
+        if (sampleCount <= 0) return FloatArray(0)
+        val bytesPerSample = (info.bitsPerSample / 8).coerceAtLeast(1)
+        val frameBytes = bytesPerSample * info.channels
+        val byteOffset = info.dataOffset + sampleOffset.toLong() * frameBytes
+        val bytesToRead = sampleCount * frameBytes
+
+        java.io.RandomAccessFile(filePath, "r").use { raf ->
+            raf.seek(byteOffset)
+            val buf = ByteArray(bytesToRead)
+            val actuallyRead = raf.read(buf).coerceAtLeast(0)
+            val validSamples = actuallyRead / frameBytes
+
+            return when (info.bitsPerSample) {
+                16 -> FloatArray(validSamples) { i ->
+                    val off = i * frameBytes
+                    val low = buf[off].toInt() and 0xFF
+                    val high = buf[off + 1].toInt()
+                    (high shl 8 or low).toFloat() / 32768f
+                }
+                32 -> FloatArray(validSamples) { i ->
+                    val off = i * frameBytes
+                    java.nio.ByteBuffer.wrap(buf, off, 4)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN).float
+                }
+                else -> throw Exception("Unsupported bits per sample: ${info.bitsPerSample}")
+            }
         }
     }
 

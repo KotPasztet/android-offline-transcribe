@@ -31,10 +31,13 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -44,6 +47,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -63,6 +67,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import android.widget.Toast
 import com.voiceping.offlinetranscription.data.cassette.MemoEntity
+import com.voiceping.offlinetranscription.service.SessionState
 import com.voiceping.offlinetranscription.util.FormatUtils
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,10 +80,13 @@ fun CassetteScreen(
     val cassette by viewModel.cassette.collectAsState()
     val memos by viewModel.memos.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
+    val sessionState by viewModel.sessionState.collectAsState()
     val confirmedText by viewModel.confirmedText.collectAsState()
     val hypothesisText by viewModel.hypothesisText.collectAsState()
     val selectedModel by viewModel.selectedModel.collectAsState()
     val fileProgress by viewModel.fileTranscriptionProgress.collectAsState()
+    val isDecoding by viewModel.isImportDecoding.collectAsState()
+    val lastError by viewModel.lastError.collectAsState()
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -87,7 +95,8 @@ fun CassetteScreen(
     }
 
     val labelColor = cassette?.let { Color(it.colorArgb) } ?: MaterialTheme.colorScheme.primary
-    val isImporting = fileProgress > 0f && fileProgress < 1f && !isRecording
+    val isImporting = (isDecoding || (fileProgress > 0f && fileProgress < 1f)) && !isRecording
+    val isPaused = sessionState == SessionState.Paused
 
     Scaffold(
         topBar = {
@@ -99,6 +108,12 @@ fun CassetteScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { viewModel.exportAndShareCassette() },
+                        enabled = memos.isNotEmpty()
+                    ) {
+                        Icon(Icons.Filled.Share, contentDescription = "Eksportuj całą kasetę")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Model: ${selectedModel.displayName}")
                     }
@@ -107,20 +122,36 @@ fun CassetteScreen(
         },
         floatingActionButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                FloatingActionButton(
-                    onClick = { filePickerLauncher.launch("audio/*") },
-                ) {
-                    Icon(Icons.Filled.UploadFile, contentDescription = "Dodaj plik audio")
+                if (!isRecording && !isPaused) {
+                    FloatingActionButton(
+                        onClick = { filePickerLauncher.launch("audio/*") },
+                    ) {
+                        Icon(Icons.Filled.UploadFile, contentDescription = "Dodaj plik audio")
+                    }
+                }
+                if (isRecording || isPaused) {
+                    // Pause/resume without ending the memo-in-progress.
+                    FloatingActionButton(
+                        onClick = { if (isPaused) viewModel.resumeRecording() else viewModel.pauseRecording() }
+                    ) {
+                        Icon(
+                            if (isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                            contentDescription = if (isPaused) "Wznów nagrywanie" else "Wstrzymaj nagrywanie"
+                        )
+                    }
                 }
                 FloatingActionButton(
                     onClick = {
-                        if (isRecording) viewModel.stopRecordingAndSaveMemo() else viewModel.startRecording()
+                        when {
+                            isRecording || isPaused -> viewModel.stopRecordingAndSaveMemo()
+                            else -> viewModel.startRecording()
+                        }
                     },
-                    containerColor = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                    containerColor = if (isRecording || isPaused) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                 ) {
                     Icon(
-                        if (isRecording) Icons.Filled.Stop else Icons.Filled.Mic,
-                        contentDescription = if (isRecording) "Zatrzymaj nagrywanie" else "Nagraj nowe memo"
+                        if (isRecording || isPaused) Icons.Filled.Stop else Icons.Filled.Mic,
+                        contentDescription = if (isRecording || isPaused) "Zakończ i zapisz nagranie" else "Nagraj nowe memo"
                     )
                 }
             }
@@ -139,10 +170,12 @@ fun CassetteScreen(
                     .background(labelColor)
             )
 
-            if (isRecording || isImporting) {
+            if (isRecording || isPaused || isImporting) {
                 LiveTranscriptCard(
                     isRecording = isRecording,
+                    isPaused = isPaused,
                     isImporting = isImporting,
+                    isDecoding = isDecoding,
                     progress = fileProgress,
                     confirmedText = confirmedText,
                     hypothesisText = hypothesisText,
@@ -150,7 +183,7 @@ fun CassetteScreen(
                 )
             }
 
-            if (memos.isEmpty() && !isRecording && !isImporting) {
+            if (memos.isEmpty() && !isRecording && !isPaused && !isImporting) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -181,12 +214,28 @@ fun CassetteScreen(
             }
         }
     }
+
+    // Transcription/import failures used to be swallowed silently (set on a
+    // StateFlow nobody displayed) — the screen just looked like "nothing
+    // happened". Now surfaced as a dismissible dialog with the real reason.
+    lastError?.let { error ->
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissError() },
+            title = { Text("Błąd") },
+            text = { Text(error.message) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissError() }) { Text("OK") }
+            }
+        )
+    }
 }
 
 @Composable
 private fun LiveTranscriptCard(
     isRecording: Boolean,
+    isPaused: Boolean,
     isImporting: Boolean,
+    isDecoding: Boolean,
     progress: Float,
     confirmedText: String,
     hypothesisText: String,
@@ -222,8 +271,10 @@ private fun LiveTranscriptCard(
             ) {
                 Text(
                     when {
+                        isPaused -> "Wstrzymano ($modelName)"
                         isRecording -> "Nagrywanie... ($modelName)"
-                        else -> "Importowanie pliku... (${(progress * 100).toInt()}%)"
+                        isDecoding -> "Dekodowanie pliku... (to może chwilę potrwać, appka działa dalej)"
+                        else -> "Transkrypcja... (${(progress * 100).toInt()}%)"
                     },
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
@@ -240,10 +291,16 @@ private fun LiveTranscriptCard(
             }
             if (isImporting) {
                 Spacer(modifier = Modifier.height(6.dp))
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth()
-                )
+                if (isDecoding) {
+                    // No percentage available yet during decode — indeterminate
+                    // spinner communicates "still working" without a fake number.
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(

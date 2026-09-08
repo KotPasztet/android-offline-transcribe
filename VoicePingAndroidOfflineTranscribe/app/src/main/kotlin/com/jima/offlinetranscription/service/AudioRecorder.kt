@@ -17,6 +17,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.voiceping.offlinetranscription.model.AudioInputMode
+import com.voiceping.offlinetranscription.util.GrowableFloatArray
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -62,8 +63,10 @@ class AudioRecorder(private val context: Context) {
     private var activeConfig: RecorderConfig? = null
     private var preferredConfig: RecorderConfig? = null
     private var mediaProjection: MediaProjection? = null
-    // Use ArrayList with initial capacity to reduce reallocation overhead
-    private val audioBuffer = ArrayList<Float>(SAMPLE_RATE * 60) // Pre-allocate ~1 min
+    // Was ArrayList<Float> — boxed every sample as a java.lang.Float object,
+    // which for long recordings (e.g. 30+ minutes) caused OutOfMemoryError
+    // crashes. GrowableFloatArray is a raw float[]-backed buffer instead.
+    private val audioBuffer = GrowableFloatArray(SAMPLE_RATE * 60) // Pre-allocate ~1 min
     private val energyHistory = ArrayList<Float>(500)
     private var droppedSampleCount = 0
 
@@ -121,7 +124,7 @@ class AudioRecorder(private val context: Context) {
             val localFrom = (absoluteFrom - droppedSampleCount).coerceIn(0, audioBuffer.size)
             val localTo = (absoluteTo - droppedSampleCount).coerceIn(localFrom, audioBuffer.size)
             if (localFrom == localTo) return FloatArray(0)
-            return audioBuffer.subList(localFrom, localTo).toFloatArray()
+            return audioBuffer.copyOfRange(localFrom, localTo)
         }
     }
 
@@ -134,7 +137,7 @@ class AudioRecorder(private val context: Context) {
             val target = beforeAbsoluteIndex.coerceAtLeast(0)
             val dropCount = (target - droppedSampleCount).coerceIn(0, audioBuffer.size)
             if (dropCount == 0) return 0
-            audioBuffer.subList(0, dropCount).clear()
+            audioBuffer.removeFirst(dropCount)
             droppedSampleCount += dropCount
             return dropCount
         }

@@ -9,17 +9,23 @@ import androidx.lifecycle.viewModelScope
 import com.voiceping.offlinetranscription.data.cassette.CassetteEntity
 import com.voiceping.offlinetranscription.data.cassette.CassetteRepository
 import com.voiceping.offlinetranscription.data.cassette.MemoEntity
+import com.voiceping.offlinetranscription.service.SessionState
 import com.voiceping.offlinetranscription.service.WhisperEngine
 import com.voiceping.offlinetranscription.util.AudioDecodeUtils
 import com.voiceping.offlinetranscription.util.CassetteAudioStorage
+import com.voiceping.offlinetranscription.util.PendingShareHolder
 import com.voiceping.offlinetranscription.util.TranscriptionCheckpointStore
 import com.voiceping.offlinetranscription.util.WavWriter
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class CassetteViewModel(
@@ -32,6 +38,7 @@ class CassetteViewModel(
     // Live engine state, reused directly (same as TranscriptionViewModel)
     // so recording / model switching / live tokens all "just work" here too.
     val isRecording = engine.isRecording
+    val sessionState = engine.sessionState
     val confirmedText = engine.confirmedText
     val hypothesisText = engine.hypothesisText
     val bufferEnergy = engine.bufferEnergy
@@ -39,11 +46,27 @@ class CassetteViewModel(
     val fileTranscriptionProgress = engine.fileTranscriptionProgress
     val lastError = engine.lastError
 
+    // True only while decoding/copying the picked file — before transcription
+    // (and its own progress bar) even starts. Shown so the UI doesn't look
+    // frozen during this phase now that it actually runs in the background.
+    private val _isImportDecoding = MutableStateFlow(false)
+    val isImportDecoding: StateFlow<Boolean> = _isImportDecoding.asStateFlow()
+
     val cassette: StateFlow<CassetteEntity?> = repository.observeCassette(cassetteId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val memos: StateFlow<List<MemoEntity>> = repository.observeMemos(cassetteId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    init {
+        // If this cassette screen was opened because the user picked it in
+        // the "share a file into a cassette" dialog, pick up and consume
+        // that pending file now.
+        PendingShareHolder.pendingAudioUri?.let { uri ->
+            PendingShareHolder.pendingAudioUri = null
+            importFileAsMemo(uri)
+        }
+    }
 
     private var mediaPlayer: MediaPlayer? = null
     private var recordingFlushJob: Job? = null
@@ -60,28 +83,48 @@ class CassetteViewModel(
         recordingFlushJob = viewModelScope.launch {
             while (true) {
                 delay(RECORDING_CHECKPOINT_INTERVAL_MS)
-                if (!engine.isRecording.value) break
-                flushRecordingCheckpoint()
+                if (engine.sessionState.value == SessionState.Idle) break
+                if (engine.sessionState.value == SessionState.Recording) {
+                    flushRecordingCheckpoint()
+                }
             }
         }
+    }
+
+    /** Pauses the current recording — mic stops, but the memo-in-progress isn't finalized. */
+    fun pauseRecording() {
+        viewModelScope.launch {
+            engine.pauseRecording()
+            flushRecordingCheckpoint()
+        }
+    }
+
+    /** Resumes a paused recording, continuing the same memo-in-progress. */
+    fun resumeRecording() {
+        engine.resumeRecording()
     }
 
     private fun flushRecordingCheckpoint() {
         val samples = engine.getRecordedSamplesSnapshot()
         if (samples.isEmpty()) return
-        try {
-            val tempFile = recordingCheckpointFile()
-            WavWriter.write(samples, com.voiceping.offlinetranscription.service.AudioConstants.SAMPLE_RATE, tempFile)
-            engine.checkpointStore.saveRecordingCheckpoint(
-                TranscriptionCheckpointStore.RecordingCheckpoint(
-                    cassetteId = cassetteId,
-                    tempWavPath = tempFile.absolutePath,
-                    lastFlushedText = engine.fullTranscriptionText,
-                    flushedAtMs = System.currentTimeMillis()
+        // Runs off the main thread — for a long recording this rewrites a
+        // growing WAV file every 5s, which would otherwise stutter/freeze
+        // the UI on every flush the longer the recording gets.
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val tempFile = recordingCheckpointFile()
+                WavWriter.write(samples, com.voiceping.offlinetranscription.service.AudioConstants.SAMPLE_RATE, tempFile)
+                engine.checkpointStore.saveRecordingCheckpoint(
+                    TranscriptionCheckpointStore.RecordingCheckpoint(
+                        cassetteId = cassetteId,
+                        tempWavPath = tempFile.absolutePath,
+                        lastFlushedText = engine.fullTranscriptionText,
+                        flushedAtMs = System.currentTimeMillis()
+                    )
                 )
-            )
-        } catch (e: Exception) {
-            Log.e("CassetteViewModel", "flushRecordingCheckpoint failed", e)
+            } catch (e: Exception) {
+                Log.e("CassetteViewModel", "flushRecordingCheckpoint failed", e)
+            }
         }
     }
 
@@ -112,9 +155,14 @@ class CassetteViewModel(
                 return@launch
             }
 
-            val tempFile = File(context.cacheDir, "memo_recording_${System.currentTimeMillis()}.wav")
-            WavWriter.write(samples, com.voiceping.offlinetranscription.service.AudioConstants.SAMPLE_RATE, tempFile)
-            val persisted = CassetteAudioStorage.persist(context, cassetteId, tempFile)
+            // File write + copy off the main thread — for a long recording
+            // this is potentially hundreds of MB, and doing it on Main would
+            // freeze the UI right as the person taps "stop".
+            val persisted = withContext(Dispatchers.IO) {
+                val tempFile = File(context.cacheDir, "memo_recording_${System.currentTimeMillis()}.wav")
+                WavWriter.write(samples, com.voiceping.offlinetranscription.service.AudioConstants.SAMPLE_RATE, tempFile)
+                CassetteAudioStorage.persist(context, cassetteId, tempFile)
+            }
 
             repository.addMemo(
                 cassetteId = cassetteId,
@@ -138,25 +186,41 @@ class CassetteViewModel(
     fun importFileAsMemo(uri: Uri) {
         viewModelScope.launch {
             try {
+                _isImportDecoding.value = true
                 val timestamp = System.currentTimeMillis()
                 val extension = guessExtension(uri)
-                val wavFile = if (extension == ".wav") {
-                    val cached = File(context.cacheDir, "import_$timestamp.wav")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        cached.outputStream().use { output -> input.copyTo(output) }
-                    } ?: return@launch
-                    cached
-                } else {
-                    val decoded = File(context.cacheDir, "import_decoded_$timestamp.wav")
-                    AudioDecodeUtils.decodeToWavFile(context, uri, decoded)
-                    decoded
+
+                // Heavy lifting (file copy + CPU-bound MediaCodec decode) off the
+                // main thread. This used to run directly inside viewModelScope.launch
+                // (= Dispatchers.Main), so for a long file (e.g. 40 minutes of m4a)
+                // the decode loop had no suspend points and froze the entire UI —
+                // black screen, no navigation, nothing — until it finished. Running
+                // it on Dispatchers.IO keeps the UI thread free the whole time.
+                val wavFile = withContext(Dispatchers.IO) {
+                    if (extension == ".wav") {
+                        val cached = File(context.cacheDir, "import_$timestamp.wav")
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            cached.outputStream().use { output -> input.copyTo(output) }
+                        } ?: return@withContext null
+                        cached
+                    } else {
+                        val decoded = File(context.cacheDir, "import_decoded_$timestamp.wav")
+                        AudioDecodeUtils.decodeToWavFile(context, uri, decoded)
+                        decoded
+                    }
+                }
+                if (wavFile == null) {
+                    _isImportDecoding.value = false
+                    return@launch
                 }
 
-                val durationMs = wavDurationMs(wavFile)
+                val durationMs = withContext(Dispatchers.IO) { wavDurationMs(wavFile) }
+                _isImportDecoding.value = false
                 engine.transcribeFile(wavFile.absolutePath, cassetteId = cassetteId)
 
                 // Poll progress until the (fire-and-forget) file transcription
                 // finishes, then persist the memo. See WhisperEngine.fileTranscriptionProgress.
+                // This loop only ever suspends on delay() — it never blocks the UI thread.
                 var started = false
                 while (true) {
                     val p = engine.fileTranscriptionProgress.value
@@ -165,7 +229,9 @@ class CassetteViewModel(
                     delay(150)
                 }
 
-                val persisted = CassetteAudioStorage.persist(context, cassetteId, wavFile)
+                val persisted = withContext(Dispatchers.IO) {
+                    CassetteAudioStorage.persist(context, cassetteId, wavFile)
+                }
                 repository.addMemo(
                     cassetteId = cassetteId,
                     audioFilePath = persisted.absolutePath,
@@ -175,6 +241,8 @@ class CassetteViewModel(
                 )
             } catch (e: Exception) {
                 Log.e("CassetteViewModel", "importFileAsMemo failed", e)
+            } finally {
+                _isImportDecoding.value = false
             }
         }
     }
@@ -183,6 +251,40 @@ class CassetteViewModel(
         viewModelScope.launch {
             repository.deleteMemo(memo)
             CassetteAudioStorage.deleteMemoFile(memo.audioFilePath)
+        }
+    }
+
+    /** Clears the current error so the dialog showing it can be dismissed. */
+    fun dismissError() {
+        engine.clearError()
+    }
+
+    /**
+     * Bundles the whole cassette (all memo audio + a combined transcript)
+     * into a .zip and opens the system Share sheet for it.
+     */
+    fun exportAndShareCassette() {
+        viewModelScope.launch {
+            try {
+                val currentCassette = cassette.value ?: repository.getCassette(cassetteId) ?: return@launch
+                val currentMemos = memos.value
+                val uri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.voiceping.offlinetranscription.util.CassetteExporter.exportCassette(
+                        context, currentCassette, currentMemos
+                    )
+                }
+                val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val chooser = android.content.Intent.createChooser(shareIntent, "Udostępnij kasetę")
+                chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(chooser)
+            } catch (e: Exception) {
+                Log.e("CassetteViewModel", "exportAndShareCassette failed", e)
+            }
         }
     }
 

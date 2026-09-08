@@ -6,6 +6,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavType
@@ -15,8 +16,10 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.voiceping.offlinetranscription.data.cassette.CassetteRepository
 import com.voiceping.offlinetranscription.service.WhisperEngine
+import com.voiceping.offlinetranscription.ui.cassette.CassetteColors
 import com.voiceping.offlinetranscription.ui.cassette.CassetteScreen
 import com.voiceping.offlinetranscription.ui.cassette.CassetteViewModel
+import com.voiceping.offlinetranscription.ui.cassette.ChooseCassetteDialog
 import com.voiceping.offlinetranscription.ui.cassette.HomeShelfScreen
 import com.voiceping.offlinetranscription.ui.cassette.HomeShelfViewModel
 import com.voiceping.offlinetranscription.ui.setup.ModelSetupScreen
@@ -25,6 +28,8 @@ import com.voiceping.offlinetranscription.ui.transcription.TranscriptionScreen
 import com.voiceping.offlinetranscription.ui.transcription.TranscriptionViewModel
 import com.voiceping.offlinetranscription.model.ModelState
 import com.voiceping.offlinetranscription.ui.cassette.CrashRecoveryCoordinator
+import com.voiceping.offlinetranscription.util.PendingShareHolder
+import kotlinx.coroutines.launch
 
 object Routes {
     const val SETUP = "setup"
@@ -43,6 +48,7 @@ fun AppNavigation(
     val modelState by engine.modelState.collectAsState()
     val navController = rememberNavController()
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
 
     val startDestination = if (modelState == ModelState.Loaded) Routes.HOME else Routes.SETUP
     var hasRunCrashRecovery by remember { mutableStateOf(false) }
@@ -130,5 +136,30 @@ fun AppNavigation(
                 }
             )
         }
+    }
+
+    // A file shared into the app from elsewhere (Share sheet) is waiting for
+    // the user to pick which cassette it should become a memo on. Shown as
+    // an overlay regardless of which screen is currently active.
+    val pendingShareUri = PendingShareHolder.pendingAudioUri
+    if (pendingShareUri != null && modelState == ModelState.Loaded) {
+        ChooseCassetteDialog(
+            repository = cassetteRepository,
+            onCassetteChosen = { cassetteId ->
+                // Leave pendingAudioUri set — the CassetteViewModel for this id
+                // consumes (and clears) it once, in its own init.
+                navController.navigate(Routes.cassette(cassetteId)) {
+                    popUpTo(Routes.HOME) { inclusive = false }
+                }
+            },
+            onCreateNewCassette = { name, onCreated ->
+                coroutineScope.launch {
+                    val color = CassetteColors[0]
+                    val id = cassetteRepository.createCassette(name, color)
+                    onCreated(id)
+                }
+            },
+            onDismiss = { PendingShareHolder.pendingAudioUri = null }
+        )
     }
 }

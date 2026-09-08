@@ -1,5 +1,7 @@
 package com.voiceping.offlinetranscription
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -15,6 +17,7 @@ import com.voiceping.offlinetranscription.model.ModelInfo
 import com.voiceping.offlinetranscription.model.ModelState
 import com.voiceping.offlinetranscription.ui.navigation.AppNavigation
 import com.voiceping.offlinetranscription.ui.theme.OfflineTranscriptionTheme
+import com.voiceping.offlinetranscription.util.PendingShareHolder
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -31,6 +34,23 @@ class MainActivity : ComponentActivity() {
         else -> 120_000L
     }
 
+    /** Extracts the shared audio Uri from an incoming ACTION_SEND intent, if any. */
+    private fun extractSharedAudioUri(intent: Intent?): Uri? {
+        if (intent == null || intent.action != Intent.ACTION_SEND) return null
+        val type = intent.type ?: return null
+        if (!type.startsWith("audio/")) return null
+        @Suppress("DEPRECATION")
+        return intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        extractSharedAudioUri(intent)?.let { uri ->
+            PendingShareHolder.pendingAudioUri = uri
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -40,6 +60,10 @@ class MainActivity : ComponentActivity() {
         val e2eModelId = intent.getStringExtra("model_id")
         val e2eTranslationSource = intent.getStringExtra("translation_source")
         val e2eTranslationTarget = intent.getStringExtra("translation_target")
+
+        extractSharedAudioUri(intent)?.let { uri ->
+            PendingShareHolder.pendingAudioUri = uri
+        }
 
         setContent {
             OfflineTranscriptionTheme {
